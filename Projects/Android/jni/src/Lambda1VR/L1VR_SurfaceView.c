@@ -104,6 +104,49 @@ struct arg_end *end;
 char **argv;
 int argc=0;
 
+GLuint vertexBuffer;
+GLuint vbo_fbo_vertices;
+GLuint program_postproc, attribute_v_coord_postproc, uniform_fbo_texture, vs, fs, uniform_width, uniform_height;
+GLuint fbo, fbo_texture, rbo_depth, vao;
+
+static const char VERTEX_SHADER_SHARPEN[] =
+	"attribute vec2 v_coord;\n"
+	"varying vec2 vTexCoords;\n"
+	"const vec2 scale = vec2(0.5, 0.5);\n"
+
+	"void main(void) {\n"
+		"vTexCoords  = v_coord * scale + scale;\n"
+		"gl_Position = vec4(v_coord , 0.0, 1.0);\n"
+	"}\n";
+
+	static const char FRAGMENT_SHADER_SHARPEN[] =
+		"uniform float width;\n"
+		"uniform float height;\n"
+		"uniform sampler2D colorMap;\n"
+		"varying vec2 vTexCoords;\n"
+
+		"void main(void) {\n"
+			"vec2 uv = vTexCoords;\n"
+			"vec2 iResolution = vec2(1824.0, 1824.0);\n"
+			"vec2 step = 1.0 / iResolution.xy;\n"
+
+			"vec3 texA = texture2D( colorMap, uv + vec2(-step.x, -step.y) * 1.5 ).rgb;\n"
+			"vec3 texB = texture2D( colorMap, uv + vec2( step.x, -step.y) * 1.5 ).rgb;\n"
+			"vec3 texC = texture2D( colorMap, uv + vec2(-step.x,  step.y) * 1.5 ).rgb;\n"
+			"vec3 texD = texture2D( colorMap, uv + vec2( step.x,  step.y) * 1.5 ).rgb;\n"
+
+		    "vec3 around = 0.25 * (texA + texB + texC + texD);\n"
+			"vec3 center  = texture2D( colorMap, uv ).rgb;\n"
+
+			"float sharpness = 1.0;\n"
+
+			"vec3 col = center + (center - around) * sharpness;\n"
+			"if(uv.y < 0.5)\n"
+				"col = center;\n"
+
+		    "gl_FragColor = vec4(col,1.0);\n"
+		"}\n";
+
 extern convar_t	*r_lefthand;
 
 enum control_scheme {
@@ -510,7 +553,8 @@ static bool ovrFramebuffer_Create( ovrFramebuffer * frameBuffer, const GLenum co
 	frameBuffer->Height = height;
 	frameBuffer->Multisamples = multisamples;
 
-	frameBuffer->ColorTextureSwapChain = vrapi_CreateTextureSwapChain3( VRAPI_TEXTURE_TYPE_2D, colorFormat, frameBuffer->Width, frameBuffer->Height, 1, 3 );
+	// SHARPEN_EFFECT: Added 1 swap chain texture to render the main game to (not used by the sawp chain itself)
+	frameBuffer->ColorTextureSwapChain = vrapi_CreateTextureSwapChain3( VRAPI_TEXTURE_TYPE_2D, colorFormat, frameBuffer->Width, frameBuffer->Height, 1, 4 );
 	frameBuffer->TextureSwapChainLength = vrapi_GetTextureSwapChainLength( frameBuffer->ColorTextureSwapChain );
 	frameBuffer->DepthBuffers = (GLuint *)malloc( frameBuffer->TextureSwapChainLength * sizeof( GLuint ) );
 	frameBuffer->FrameBuffers = (GLuint *)malloc( frameBuffer->TextureSwapChainLength * sizeof( GLuint ) );
@@ -537,7 +581,7 @@ static bool ovrFramebuffer_Create( ovrFramebuffer * frameBuffer, const GLenum co
 
 		if (multisamples > 1 && glRenderbufferStorageMultisampleEXT != NULL && glFramebufferTexture2DMultisampleEXT != NULL)
 		{
-			
+
 			// Create multisampled depth buffer.
 			GL(glGenRenderbuffers(1, &frameBuffer->DepthBuffers[i]));
 			GL(glBindRenderbuffer(GL_RENDERBUFFER, frameBuffer->DepthBuffers[i]));
@@ -626,7 +670,8 @@ void ovrFramebuffer_Resolve( ovrFramebuffer * frameBuffer )
 void ovrFramebuffer_Advance( ovrFramebuffer * frameBuffer )
 {
 	// Advance to the next texture from the set.
-	frameBuffer->TextureSwapChainIndex = ( frameBuffer->TextureSwapChainIndex + 1 ) % frameBuffer->TextureSwapChainLength;
+	// SHARPEN_EFFECT: Added -1 at the end to not use the last render target for the sawp chain
+	frameBuffer->TextureSwapChainIndex = ( frameBuffer->TextureSwapChainIndex + 1 ) % (frameBuffer->TextureSwapChainLength-1);
 }
 
 
@@ -692,6 +737,28 @@ void ovrRenderer_Clear( ovrRenderer * renderer )
 
 void ovrRenderer_Create( int width, int height, ovrRenderer * renderer, const ovrJava * java )
 {
+	LOAD_GLES2(glGenBuffers);
+	LOAD_GLES2(glBindBuffer);
+	LOAD_GLES2(glBufferData);
+	LOAD_GLES2(glGetIntegerv);
+    LOAD_GLES2(glBindAttribLocation);
+    LOAD_GLES2(glGetUniformLocation);
+    LOAD_GLES2(glUniform1i);
+	LOAD_GLES2(glGetAttribLocation);
+	LOAD_GLES2(glActiveTexture);
+	LOAD_GLES2(glGenTextures);
+	LOAD_GLES2(glBindTexture);
+	LOAD_GLES2(glTexParameteri);
+	LOAD_GLES2(glTexImage2D);
+	LOAD_GLES2(glGenRenderbuffers);
+	LOAD_GLES2(glRenderbufferStorage);
+	LOAD_GLES2(glBindRenderbuffer);
+	LOAD_GLES2(glGenFramebuffers);
+	LOAD_GLES2(glBindFramebuffer);
+	LOAD_GLES2(glFramebufferTexture2D);
+	LOAD_GLES2(glFramebufferRenderbuffer);
+	LOAD_GLES2(glCheckFramebufferStatus);
+
 	renderer->NumBuffers = VRAPI_FRAME_LAYER_EYE_MAX;
 
 	//Now using a symmetrical render target, based on the horizontal FOV
@@ -711,6 +778,92 @@ void ovrRenderer_Create( int width, int height, ovrRenderer * renderer, const ov
 	renderer->ProjectionMatrix = ovrMatrix4f_CreateProjectionFov(
 			vrFOV, vrFOV, 0.0f, 0.0f, 1.0f, 0.0f );
 
+	static const GLfloat vertexBufferData[] =
+	{
+		-1, -1,
+	     1, -1,
+	    -1,  1,
+	     1,  1,
+ 	};
+
+	glGenBuffers(1, &vertexBuffer);
+	glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertexBufferData), vertexBufferData, GL_STATIC_DRAW);
+
+	GLint r, link_ok, validate_ok;
+	vs = glCreateShader( GL_VERTEX_SHADER );
+	const char * vertexSource = VERTEX_SHADER_SHARPEN;
+	glShaderSource( vs, 1, &vertexSource, 0 );
+	glCompileShader( vs );
+	glGetShaderiv( vs, GL_COMPILE_STATUS, &r );
+	if ( r == GL_FALSE )
+	{
+		GLchar msg[4096];
+		glGetShaderInfoLog( vs, sizeof( msg ), 0, msg );
+		MsgDev( D_INFO, "*** VS compile error %s\n", msg );
+		return;
+	}
+
+	fs = glCreateShader( GL_FRAGMENT_SHADER );
+	const char * fragmentSource = FRAGMENT_SHADER_SHARPEN;
+	glShaderSource( fs, 1, &fragmentSource, 0 );
+	glCompileShader( fs );
+	glGetShaderiv( fs, GL_COMPILE_STATUS, &r );
+	if ( r == GL_FALSE )
+	{
+		GLchar msg[4096];
+		glGetShaderInfoLog( fs, sizeof( msg ), 0, msg );
+		MsgDev( D_INFO, "*** FS compile error %s\n", msg );
+		return;
+	}
+	MsgDev( D_INFO, "*** Shader compile ok\n" );
+
+	GL( program_postproc = glCreateProgram() );
+	GL( glAttachShader( program_postproc, vs ) );
+	GL( glAttachShader( program_postproc, fs ) );
+	GL( glLinkProgram( program_postproc ) );
+	GL( glGetProgramiv( program_postproc, GL_LINK_STATUS, &link_ok ) );
+	if (!link_ok)
+	{
+		GLchar msg[4096];
+		GL( glGetProgramInfoLog( program_postproc, sizeof( msg ), 0, msg ) );
+		MsgDev( D_INFO, "*** Link error:\n %s \n", msg );
+		//return;
+	}
+
+	glValidateProgram(program_postproc);
+	glGetProgramiv(program_postproc, GL_VALIDATE_STATUS, &validate_ok);
+
+	if (!validate_ok)
+	{
+		MsgDev( D_INFO, "*** Validation error\n" );
+	}
+	else
+	{
+		MsgDev( D_INFO, "*** Validation ok\n" );
+	}
+
+	const char* attribute_name = "v_coord";
+	attribute_v_coord_postproc = glGetAttribLocation(program_postproc, attribute_name);
+	if (attribute_v_coord_postproc == -1)
+	{
+		MsgDev( D_INFO, "*** v_coord attrib error\n" );
+		return ;
+	}
+	MsgDev( D_INFO, "*** v_coord %i\n", attribute_v_coord_postproc );
+
+	const char* uniform_name = "colorMap";
+	uniform_fbo_texture = glGetUniformLocation(program_postproc, uniform_name);
+	if (uniform_fbo_texture == -1)
+	{
+		MsgDev( D_INFO, "*** fbo_texture error" );
+		return;
+	}
+
+	uniform_width = glGetUniformLocation(program_postproc, "width");
+	uniform_height = glGetUniformLocation(program_postproc, "height");
+
+	MsgDev( D_INFO, "*** Finished creation\n" );
 }
 
 void ovrRenderer_Destroy( ovrRenderer * renderer )
@@ -905,6 +1058,16 @@ void COM_SetRandomSeed( int lSeed );
 void RenderFrame( ovrRenderer * renderer, const ovrJava * java,
 											const ovrTracking2 * tracking, ovrMobile * ovr )
 {
+	LOAD_GLES2(glEnableVertexAttribArray);
+	LOAD_GLES2(glBindBuffer);
+	LOAD_GLES2(glVertexAttribPointer);
+	LOAD_GLES2(glDrawArrays);
+	LOAD_GLES2(glDisableVertexAttribArray);
+	LOAD_GLES2(glUniform1i);
+	LOAD_GLES2(glBindFramebuffer);
+	LOAD_GLES2(glBindTexture);
+	LOAD_GLES2(glCopyTexSubImage2D);
+
     //if we are now shutting down, drop out here
     if (isHostAlive()) {
 
@@ -917,7 +1080,10 @@ void RenderFrame( ovrRenderer * renderer, const ovrJava * java,
 		// Render the eye images.
         for (int eye = 0; eye < renderer->NumBuffers && isHostAlive(); eye++) {
             ovrFramebuffer *frameBuffer = &(renderer->FrameBuffer[eye]);
-            ovrFramebuffer_SetCurrent(frameBuffer);
+			//SHARPEN_EFFECT: Use last sawp chain texture as rendertarget for main game
+			int tempIndex = frameBuffer->TextureSwapChainLength-1;
+			GL( gles_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, frameBuffer->FrameBuffers[tempIndex] ) );
+            //ovrFramebuffer_SetCurrent(frameBuffer);
 
             {
                 GL(glEnable(GL_SCISSOR_TEST));
@@ -940,6 +1106,30 @@ void RenderFrame( ovrRenderer * renderer, const ovrJava * java,
 				COM_SetRandomSeed(lSeed);
 
                 Host_Frame();
+
+				// SHARPEN_EFFECT: Clear color and bind fullscreen shader
+				ovrFramebuffer_SetCurrent(frameBuffer);
+				GL(glClearColor(0.0f, 0.0f, 0.0f, 1.0f));
+                GL(glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+				const GLuint colorTexture = vrapi_GetTextureSwapChainHandle( frameBuffer->ColorTextureSwapChain, tempIndex);
+				gles_glBindTexture(GL_TEXTURE_2D, colorTexture);
+				glUniform1i(uniform_fbo_texture, colorTexture);
+				glUniform1f(uniform_width, frameBuffer->Width);
+				glUniform1f(uniform_height, frameBuffer->Height);
+				//MsgDev( D_INFO, "*** width: %i Height: %i \n", frameBuffer->Width, frameBuffer->Height );
+				GL(glUseProgram(program_postproc));
+				glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+
+				// SHARPEN_EFFECT: Render fullscreen quad with shader
+				GL(glEnableVertexAttribArray(attribute_v_coord_postproc));
+				glVertexAttribPointer(attribute_v_coord_postproc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+				// SHARPEN_EFFECT: Clear buffers
+				GL(glDisableVertexAttribArray(attribute_v_coord_postproc));
+				GL(glUseProgram(0));
+				glBindBuffer(GL_ARRAY_BUFFER, 0);
+				gles_glBindTexture(GL_TEXTURE_2D, 0);
             }
 
             //Clear edge to prevent smearing
